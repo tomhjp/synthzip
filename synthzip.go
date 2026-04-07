@@ -50,8 +50,9 @@ var (
 	// _ fs.ReadDirFile = (*Archive)(nil)
 )
 
-// Archive is a pre-computed zip archive layout that can report its total
-// size and serve arbitrary byte ranges without materialising the full zip.
+// Archive implements a virtual, read-only ZIP archive. Use [New] to construct
+// a functional [Archive]. It implements [io.Reader], [io.Seeker], and
+// [io.ReaderAt] for reading the archive contents.
 type Archive struct {
 	files        []File
 	regions      []region
@@ -64,9 +65,15 @@ type Archive struct {
 	readOffset int64
 }
 
-// New creates a new Archive from the given file list. Files appear in the zip
+// New creates a new [Archive] from the given file list. Files appear in the zip
 // in the order provided. Returns an error if any file has an empty name,
-// negative size, or zero CRC32 with non-zero size.
+// negative size, or zero CRC32 with non-zero size. The open function will not
+// be called during construction. It will be passed the provided file name from
+// files when a read on the returned [Archive] requires its contents.
+//
+// As an optimisation, the open function may return a type that implements
+// [io.ReaderAt], which will be used to skip any leading bytes not needed for
+// reads that start within a file's data region.
 func New(files []File, open func(name string) (io.ReadCloser, error)) (*Archive, error) {
 	for i, f := range files {
 		if f.Name == "" {
