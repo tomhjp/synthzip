@@ -58,14 +58,26 @@ func TestByteForByteAgainstStdLib(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			files, open := testFiles(tc.files)
-			a, err := New(files, open)
-			if err != nil {
-				t.Fatalf("New: %v", err)
+		for _, withCRC := range []bool{true, false} {
+			suffix := "/with_crc"
+			if !withCRC {
+				suffix = "/no_crc"
 			}
-			verifyWithStdlib(t, a, tc.files)
-		})
+			t.Run(tc.name+suffix, func(t *testing.T) {
+				var files []File
+				var open func(string) (io.ReadCloser, error)
+				if withCRC {
+					files, open = testFiles(tc.files)
+				} else {
+					files, open = testFilesNoCRC(tc.files)
+				}
+				a, err := New(files, open)
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				verifyWithStdlib(t, a, tc.files)
+			})
+		}
 	}
 }
 
@@ -127,44 +139,59 @@ func verifyWithStdlib(t *testing.T, a *Archive, contents map[string][]byte) {
 // TestPartialReads verifies that reading the zip in small chunks via
 // repeated ReadAt calls produces the same result as a single full read.
 func TestPartialReads(t *testing.T) {
-	files, open := testFiles(map[string][]byte{
+	contents := map[string][]byte{
 		"a.txt": []byte("hello world"),
 		"b.txt": []byte("goodbye world, this is a longer file to ensure we span regions"),
 		"c.txt": bytes.Repeat([]byte("x"), 1000),
-	})
-	a, err := New(files, open)
-	if err != nil {
-		t.Fatalf("New: %v", err)
 	}
 
-	fullData, err := io.ReadAll(a)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Read in various chunk sizes
-	for _, chunkSize := range []int{1, 7, 13, 64, 256} {
-		t.Run(fmt.Sprintf("chunk_%d", chunkSize), func(t *testing.T) {
-			var assembled []byte
-			off := int64(0)
-			size := a.Size()
-			for off < size {
-				n := int64(chunkSize)
-				if off+n > size {
-					n = size - off
-				}
-				buf := make([]byte, n)
-				got, err := a.ReadAt(buf, off)
-				if err != nil && err != io.EOF {
-					t.Fatalf("ReadAt(off=%d, len=%d): %v", off, n, err)
-				}
-				assembled = append(assembled, buf[:got]...)
-				off += int64(got)
+	for _, withCRC := range []bool{true, false} {
+		name := "with_crc"
+		if !withCRC {
+			name = "no_crc"
+		}
+		t.Run(name, func(t *testing.T) {
+			var files []File
+			var open func(string) (io.ReadCloser, error)
+			if withCRC {
+				files, open = testFiles(contents)
+			} else {
+				files, open = testFilesNoCRC(contents)
+			}
+			a, err := New(files, open)
+			if err != nil {
+				t.Fatalf("New: %v", err)
 			}
 
-			if !bytes.Equal(assembled, fullData) {
-				t.Errorf("chunk size %d: assembled %d bytes differs from full read %d bytes",
-					chunkSize, len(assembled), len(fullData))
+			fullData, err := io.ReadAll(a)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, chunkSize := range []int{1, 7, 13, 64, 256} {
+				t.Run(fmt.Sprintf("chunk_%d", chunkSize), func(t *testing.T) {
+					var assembled []byte
+					off := int64(0)
+					size := a.Size()
+					for off < size {
+						n := int64(chunkSize)
+						if off+n > size {
+							n = size - off
+						}
+						buf := make([]byte, n)
+						got, err := a.ReadAt(buf, off)
+						if err != nil && err != io.EOF {
+							t.Fatalf("ReadAt(off=%d, len=%d): %v", off, n, err)
+						}
+						assembled = append(assembled, buf[:got]...)
+						off += int64(got)
+					}
+
+					if !bytes.Equal(assembled, fullData) {
+						t.Errorf("chunk size %d: assembled %d bytes differs from full read %d bytes",
+							chunkSize, len(assembled), len(fullData))
+					}
+				})
 			}
 		})
 	}
@@ -260,23 +287,34 @@ func TestSize(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			files, open := testFiles(tc.files)
-			a, err := New(files, open)
-			if err != nil {
-				t.Fatalf("New: %v", err)
+		for _, withCRC := range []bool{true, false} {
+			suffix := "/with_crc"
+			if !withCRC {
+				suffix = "/no_crc"
 			}
+			t.Run(tc.name+suffix, func(t *testing.T) {
+				var files []File
+				var open func(string) (io.ReadCloser, error)
+				if withCRC {
+					files, open = testFiles(tc.files)
+				} else {
+					files, open = testFilesNoCRC(tc.files)
+				}
+				a, err := New(files, open)
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
 
-			// Read one byte past the end to check for exact size.
-			buf := make([]byte, a.Size()+1)
-			n, err := a.ReadAt(buf, 0)
-			if err != io.EOF {
-				t.Fatalf("ReadAt: %v", err)
-			}
-			if int64(n) != a.Size() {
-				t.Errorf("ReadAt returned %d bytes, Size() = %d", n, a.Size())
-			}
-		})
+				buf := make([]byte, a.Size()+1)
+				n, err := a.ReadAt(buf, 0)
+				if err != io.EOF {
+					t.Fatalf("ReadAt: %v", err)
+				}
+				if int64(n) != a.Size() {
+					t.Errorf("ReadAt returned %d bytes, Size() = %d", n, a.Size())
+				}
+			})
+		}
 	}
 }
 
@@ -300,12 +338,6 @@ func TestNewValidation(t *testing.T) {
 	t.Run("negative_size", func(t *testing.T) {
 		if _, err := New([]File{{Name: "a.txt", Size: -1, CRC32: 123}}, nil); err == nil {
 			t.Error("expected error for negative size")
-		}
-	})
-
-	t.Run("missing_crc32", func(t *testing.T) {
-		if _, err := New([]File{{Name: "a.txt", Size: 10, CRC32: 0}}, nil); err == nil {
-			t.Error("expected error for zero CRC32 with non-zero size")
 		}
 	})
 
@@ -346,6 +378,96 @@ func TestReadAtBeyondEnd(t *testing.T) {
 	}
 }
 
+func TestNoCRC32MixedFiles(t *testing.T) {
+	contents := map[string][]byte{
+		"eager.txt": []byte("I have a CRC"),
+		"lazy.txt":  []byte("I do not"),
+		"empty.txt": nil,
+	}
+
+	files := []File{
+		{Name: "eager.txt", Size: int64(len(contents["eager.txt"])), CRC32: crc32.ChecksumIEEE(contents["eager.txt"])},
+		{Name: "lazy.txt", Size: int64(len(contents["lazy.txt"]))}, // CRC32 omitted
+		{Name: "empty.txt", Size: 0},
+	}
+	open := testOpener(contents)
+	a, err := New(files, open)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	verifyWithStdlib(t, a, contents)
+}
+
+func TestNoCRC32DiffersOnlyInCRCBytes(t *testing.T) {
+	// Use a fixed file list to get deterministic ordering.
+	files := []File{
+		{Name: "a.txt", Size: 5, CRC32: crc32.ChecksumIEEE([]byte("hello"))},
+		{Name: "bb.txt", Size: 3, CRC32: crc32.ChecksumIEEE([]byte("bye"))},
+	}
+	contents := map[string][]byte{
+		"a.txt":  []byte("hello"),
+		"bb.txt": []byte("bye"),
+	}
+	open := testOpener(contents)
+
+	eagerA, err := New(files, open)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	noCRCFiles := []File{
+		{Name: "a.txt", Size: 5},
+		{Name: "bb.txt", Size: 3},
+	}
+	noCRCA, err := New(noCRCFiles, open)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if eagerA.Size() != noCRCA.Size() {
+		t.Fatalf("sizes differ: eager=%d, noCRC=%d", eagerA.Size(), noCRCA.Size())
+	}
+
+	eager := make([]byte, eagerA.Size())
+	noCRC := make([]byte, noCRCA.Size())
+	if _, err := eagerA.ReadAt(eager, 0); err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	if _, err := noCRCA.ReadAt(noCRC, 0); err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+
+	// Zero out the CRC32 fields in the eager archive, then compare.
+	// Local header CRC32 is at offset 14 within each local header (4 bytes).
+	// Central dir CRC32 is at offset 16 within each central dir entry (4 bytes).
+	//
+	// File layout:
+	//   local header 0: offset 0,  length 30+5=35,  CRC at 0+14
+	//   file data 0:    offset 35, length 5
+	//   local header 1: offset 40, length 30+6=36,  CRC at 40+14
+	//   file data 1:    offset 76, length 3
+	//   central dir 0:  offset 79, length 46+5=51,  CRC at 79+16
+	//   central dir 1:  offset 130, length 46+6=52, CRC at 130+16
+	//   EOCD:           offset 182, length 22
+
+	// Zero local header CRC fields.
+	copy(eager[14:18], []byte{0, 0, 0, 0}) // file 0
+	copy(eager[54:58], []byte{0, 0, 0, 0}) // file 1
+	// Zero central dir CRC fields.
+	copy(eager[95:99], []byte{0, 0, 0, 0})   // file 0
+	copy(eager[146:150], []byte{0, 0, 0, 0}) // file 1
+
+	if !bytes.Equal(eager, noCRC) {
+		t.Error("archives differ in bytes other than CRC32 fields")
+		for i := range eager {
+			if eager[i] != noCRC[i] {
+				t.Errorf("  byte %d: eager=%#02x, noCRC=%#02x", i, eager[i], noCRC[i])
+			}
+		}
+	}
+}
+
 func testFiles(contents map[string][]byte) ([]File, func(string) (io.ReadCloser, error)) {
 	var files []File
 	for name, data := range contents {
@@ -355,12 +477,27 @@ func testFiles(contents map[string][]byte) ([]File, func(string) (io.ReadCloser,
 			CRC32: crc32.ChecksumIEEE(data),
 		})
 	}
-	open := func(name string) (io.ReadCloser, error) {
+	return files, testOpener(contents)
+}
+
+func testFilesNoCRC(contents map[string][]byte) ([]File, func(string) (io.ReadCloser, error)) {
+	var files []File
+	for name, data := range contents {
+		files = append(files, File{
+			Name: name,
+			Size: int64(len(data)),
+			// CRC32 intentionally omitted.
+		})
+	}
+	return files, testOpener(contents)
+}
+
+func testOpener(contents map[string][]byte) func(string) (io.ReadCloser, error) {
+	return func(name string) (io.ReadCloser, error) {
 		data, ok := contents[name]
 		if !ok {
 			return nil, fmt.Errorf("file not found: %s", name)
 		}
 		return io.NopCloser(bytes.NewReader(data)), nil
 	}
-	return files, open
 }

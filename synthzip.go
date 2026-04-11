@@ -8,6 +8,8 @@ import (
 	"sort"
 )
 
+// See zip spec at https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
+
 // File describes a file to include in the synthetic zip archive.
 type File struct {
 	// Name is the full path in the zip (e.g. "foo/bar/main.go"), passed to the
@@ -20,7 +22,9 @@ type File struct {
 	Size int64
 
 	// CRC32 is the CRC-32 checksum of the file content using the IEEE polynomial.
-	// Required for files with Size > 0.
+	// It may be omitted, in which case the CRC-32 field in the zip headers will
+	// also be zero and some tools will warn or error for non-empty files.
+	// However, the go standard library accepts zeroed CRC-32s without complaint.
 	CRC32 uint32
 }
 
@@ -67,14 +71,19 @@ type Archive struct {
 
 // New creates a new [Archive] from the given file list. Files appear in the zip
 // in the order provided. Returns an error if any file has an empty name,
-// negative size, or zero CRC32 with non-zero size. The open function will not
-// be called during construction. It will be passed the provided file name from
-// files when a read on the returned [Archive] requires its contents.
+// or negative size. The open function will not be called during construction.
+// It will be passed the provided file name from files when a read on the
+// returned [Archive] requires its contents.
 //
 // As an optimisation, the open function may return a type that implements
 // [io.ReaderAt], which will be used to skip any leading bytes not needed for
 // reads that start within a file's data region.
 func New(files []File, open func(name string) (io.ReadCloser, error)) (*Archive, error) {
+	var (
+		off          int64
+		regions      []region
+		localOffsets = make([]int64, len(files))
+	)
 	for i, f := range files {
 		if f.Name == "" {
 			return nil, fmt.Errorf("synthzip: file %d has empty name", i)
@@ -85,50 +94,62 @@ func New(files []File, open func(name string) (io.ReadCloser, error)) (*Archive,
 		if f.Size < 0 {
 			return nil, fmt.Errorf("synthzip: file %d (%q) has negative size", i, f.Name)
 		}
-		if f.Size > 0 && f.CRC32 == 0 {
-			return nil, fmt.Errorf("synthzip: file %d (%q) has zero CRC32 with non-zero size", i, f.Name)
-		}
-	}
 
-	a := &Archive{
-		files:        append([]File(nil), files...),
-		localOffsets: make([]int64, len(files)),
-		open:         open,
-	}
-
-	var off int64
-	for i, f := range files {
-		nameLen := int64(len(f.Name))
-
-		// Local file header
-		a.localOffsets[i] = off
-		headerLen := 30 + nameLen
-		a.regions = append(a.regions, region{offset: off, length: headerLen, kind: regionLocalHeader, index: i})
+		// Local file header.
+		localOffsets[i] = off
+		headerLen := 30 + int64(len(f.Name))
+		regions = append(regions, region{
+			offset: off,
+			length: headerLen,
+			kind:   regionLocalHeader,
+			index:  i,
+		})
 		off += headerLen
 
-		// File data
+		// File data.
 		if f.Size > 0 {
-			a.regions = append(a.regions, region{offset: off, length: f.Size, kind: regionFileData, index: i})
+			regions = append(regions, region{
+				offset: off,
+				length: f.Size,
+				kind:   regionFileData,
+				index:  i,
+			})
 			off += f.Size
 		}
 	}
 
-	// Central directory
-	a.cdOffset = off
+	// Central directory.
+	cdOffset := off
 	for i, f := range files {
 		nameLen := int64(len(f.Name))
 		entryLen := 46 + nameLen
-		a.regions = append(a.regions, region{offset: off, length: entryLen, kind: regionCentralDir, index: i})
+		regions = append(regions, region{
+			offset: off,
+			length: entryLen,
+			kind:   regionCentralDir,
+			index:  i,
+		})
 		off += entryLen
 	}
-	a.cdSize = off - a.cdOffset
+	cdSize := off - cdOffset
 
 	// EOCD
-	a.regions = append(a.regions, region{offset: off, length: 22, kind: regionEOCD})
+	regions = append(regions, region{
+		offset: off,
+		length: 22,
+		kind:   regionEOCD,
+	})
 	off += 22
 
-	a.size = off
-	return a, nil
+	return &Archive{
+		regions:      regions,
+		files:        files,
+		localOffsets: localOffsets,
+		open:         open,
+		size:         off,
+		cdOffset:     cdOffset,
+		cdSize:       cdSize,
+	}, nil
 }
 
 // Size returns the total size of the zip archive in bytes. This is available
@@ -189,24 +210,24 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 			if err != nil {
 				return total, err
 			}
+			defer rc.Close()
+
 			if ra, ok := rc.(io.ReaderAt); ok && intraOffset > 0 {
 				if _, err := ra.ReadAt(dst, intraOffset); err != nil {
-					rc.Close()
 					return total, err
 				}
 			} else {
 				if intraOffset > 0 {
 					if _, err := io.CopyN(io.Discard, rc, intraOffset); err != nil {
-						rc.Close()
 						return total, err
 					}
 				}
 				if _, err := io.ReadFull(rc, dst); err != nil {
-					rc.Close()
 					return total, err
 				}
 			}
-			rc.Close()
+		default:
+			return 0, fmt.Errorf("synthzip: unknown region kind %d", r.kind)
 		}
 
 		total += n
@@ -251,17 +272,9 @@ func (a *Archive) Seek(offset int64, whence int) (int64, error) {
 func makeLocalHeader(f File) []byte {
 	nameBytes := []byte(f.Name)
 	buf := make([]byte, 30+len(nameBytes))
-	binary.LittleEndian.PutUint32(buf[0:], 0x04034b50)              // signature
-	binary.LittleEndian.PutUint16(buf[4:], 20)                      // version needed
-	binary.LittleEndian.PutUint16(buf[6:], 0)                       // flags
-	binary.LittleEndian.PutUint16(buf[8:], 0)                       // compression: store
-	binary.LittleEndian.PutUint16(buf[10:], 0)                      // mod time
-	binary.LittleEndian.PutUint16(buf[12:], 0x0021)                 // mod date: 1980-01-01
-	binary.LittleEndian.PutUint32(buf[14:], f.CRC32)                // crc32
-	binary.LittleEndian.PutUint32(buf[18:], uint32(f.Size))         // compressed size
-	binary.LittleEndian.PutUint32(buf[22:], uint32(f.Size))         // uncompressed size
-	binary.LittleEndian.PutUint16(buf[26:], uint16(len(nameBytes))) // name length
-	binary.LittleEndian.PutUint16(buf[28:], 0)                      // extra field length
+	binary.LittleEndian.PutUint32(buf[0:], 0x04034b50) // signature
+	binary.LittleEndian.PutUint16(buf[4:], 20)         // version needed
+	makeHeaderCommon(f, buf[6:])
 	copy(buf[30:], nameBytes)
 	return buf
 }
@@ -269,25 +282,29 @@ func makeLocalHeader(f File) []byte {
 func makeCentralDirEntry(f File, localOffset int64) []byte {
 	nameBytes := []byte(f.Name)
 	buf := make([]byte, 46+len(nameBytes))
-	binary.LittleEndian.PutUint32(buf[0:], 0x02014b50)              // signature
-	binary.LittleEndian.PutUint16(buf[4:], 0x0314)                  // version made by: Unix, 2.0
-	binary.LittleEndian.PutUint16(buf[6:], 20)                      // version needed
-	binary.LittleEndian.PutUint16(buf[8:], 0)                       // flags
-	binary.LittleEndian.PutUint16(buf[10:], 0)                      // compression: store
-	binary.LittleEndian.PutUint16(buf[12:], 0)                      // mod time
-	binary.LittleEndian.PutUint16(buf[14:], 0x0021)                 // mod date: 1980-01-01
-	binary.LittleEndian.PutUint32(buf[16:], f.CRC32)                // crc32
-	binary.LittleEndian.PutUint32(buf[20:], uint32(f.Size))         // compressed size
-	binary.LittleEndian.PutUint32(buf[24:], uint32(f.Size))         // uncompressed size
-	binary.LittleEndian.PutUint16(buf[28:], uint16(len(nameBytes))) // name length
-	binary.LittleEndian.PutUint16(buf[30:], 0)                      // extra field length
-	binary.LittleEndian.PutUint16(buf[32:], 0)                      // file comment length
-	binary.LittleEndian.PutUint16(buf[34:], 0)                      // disk number start
-	binary.LittleEndian.PutUint16(buf[36:], 0)                      // internal attrs
-	binary.LittleEndian.PutUint32(buf[38:], 0o644<<16)              // external attrs: Unix 0644
-	binary.LittleEndian.PutUint32(buf[42:], uint32(localOffset))    // local header offset
+	binary.LittleEndian.PutUint32(buf[0:], 0x02014b50) // signature
+	binary.LittleEndian.PutUint16(buf[4:], 0x0314)     // version made by: Unix, 2.0
+	binary.LittleEndian.PutUint16(buf[6:], 20)         // version needed
+	makeHeaderCommon(f, buf[8:])
+	binary.LittleEndian.PutUint16(buf[32:], 0)                   // file comment length
+	binary.LittleEndian.PutUint16(buf[34:], 0)                   // disk number start
+	binary.LittleEndian.PutUint16(buf[36:], 0)                   // internal attrs
+	binary.LittleEndian.PutUint32(buf[38:], 0o644<<16)           // external attrs: Unix 0644
+	binary.LittleEndian.PutUint32(buf[42:], uint32(localOffset)) // local header offset
 	copy(buf[46:], nameBytes)
 	return buf
+}
+
+func makeHeaderCommon(f File, buf []byte) {
+	binary.LittleEndian.PutUint16(buf[0:], 0)                    // flags
+	binary.LittleEndian.PutUint16(buf[2:], 0)                    // compression: store
+	binary.LittleEndian.PutUint16(buf[4:], 0)                    // mod time
+	binary.LittleEndian.PutUint16(buf[6:], 0x0021)               // mod date: 1980-01-01
+	binary.LittleEndian.PutUint32(buf[8:], f.CRC32)              // crc32
+	binary.LittleEndian.PutUint32(buf[12:], uint32(f.Size))      // compressed size
+	binary.LittleEndian.PutUint32(buf[16:], uint32(f.Size))      // uncompressed size
+	binary.LittleEndian.PutUint16(buf[20:], uint16(len(f.Name))) // name length
+	binary.LittleEndian.PutUint16(buf[22:], 0)                   // extra field length
 }
 
 func makeEOCD(numFiles int, cdOffset, cdSize int64) []byte {

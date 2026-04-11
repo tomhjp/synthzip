@@ -14,21 +14,27 @@ import (
 // matches a stdlib-produced zip byte-for-byte.
 func FuzzByteForByte(f *testing.F) {
 	// Seed corpus: each entry is a blob encoding a list of files.
-	f.Add(encodeFileList(nil))
-	f.Add(encodeFileList([]fileEntry{{name: "a.txt", data: []byte("hello")}}))
+	f.Add(encodeFileList(nil), false)
+	f.Add(encodeFileList([]fileEntry{{name: "a.txt", data: []byte("hello")}}), false)
 	f.Add(encodeFileList([]fileEntry{
 		{name: "empty", data: nil},
 		{name: "x", data: []byte{0xff}},
 		{name: "a/b/c.txt", data: []byte("nested")},
-	}))
+	}), false)
+	f.Add(encodeFileList([]fileEntry{{name: "a.txt", data: []byte("hello")}}), true)
+	f.Add(encodeFileList([]fileEntry{
+		{name: "empty", data: nil},
+		{name: "x", data: []byte{0xff}},
+		{name: "a/b/c.txt", data: []byte("nested")},
+	}), true)
 
-	f.Fuzz(func(t *testing.T, blob []byte) {
+	f.Fuzz(func(t *testing.T, blob []byte, noCRC bool) {
 		entries := decodeFileList(blob)
 		if len(entries) == 0 {
 			return
 		}
 
-		contents, files := filesFromEntries(entries)
+		contents, files := filesFromEntries(entries, !noCRC)
 		open := openerFromMap(contents)
 		a, err := New(files, open)
 		if err != nil {
@@ -43,23 +49,27 @@ func FuzzByteForByte(f *testing.F) {
 func FuzzReadAt(f *testing.F) {
 	f.Add(
 		encodeFileList([]fileEntry{{name: "a.txt", data: []byte("hello")}}),
-		int64(0), uint16(5),
+		int64(0), uint16(5), false,
 	)
 	f.Add(
 		encodeFileList([]fileEntry{
 			{name: "x", data: []byte("abc")},
 			{name: "y", data: []byte("defgh")},
 		}),
-		int64(3), uint16(20),
+		int64(3), uint16(20), false,
+	)
+	f.Add(
+		encodeFileList([]fileEntry{{name: "a.txt", data: []byte("hello")}}),
+		int64(0), uint16(5), true,
 	)
 
-	f.Fuzz(func(t *testing.T, blob []byte, offset int64, length uint16) {
+	f.Fuzz(func(t *testing.T, blob []byte, offset int64, length uint16, noCRC bool) {
 		entries := decodeFileList(blob)
 		if len(entries) == 0 {
 			return
 		}
 
-		contents, files := filesFromEntries(entries)
+		contents, files := filesFromEntries(entries, !noCRC)
 		open := openerFromMap(contents)
 		a, err := New(files, open)
 		if err != nil {
@@ -204,16 +214,19 @@ func sanitizeFuzzName(raw string) string {
 	return s
 }
 
-func filesFromEntries(entries []fileEntry) (map[string][]byte, []File) {
+func filesFromEntries(entries []fileEntry, withCRC bool) (map[string][]byte, []File) {
 	contents := make(map[string][]byte, len(entries))
 	var files []File
 	for _, e := range entries {
 		contents[e.name] = e.data
-		files = append(files, File{
-			Name:  e.name,
-			Size:  int64(len(e.data)),
-			CRC32: crc32.ChecksumIEEE(e.data),
-		})
+		f := File{
+			Name: e.name,
+			Size: int64(len(e.data)),
+		}
+		if withCRC {
+			f.CRC32 = crc32.ChecksumIEEE(e.data)
+		}
+		files = append(files, f)
 	}
 	return contents, files
 }

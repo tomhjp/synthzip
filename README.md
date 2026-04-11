@@ -23,4 +23,3 @@ See [`example_test.go`](example_test.go) for a working example.
 ## Limitations
 
 - File sizes are limited to 4 GiB (ZIP32). ZIP64 extensions are not supported.
-- CRC-32 must be provided upfront for all non-empty files.
