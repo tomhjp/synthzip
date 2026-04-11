@@ -303,12 +303,6 @@ func TestNewValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("missing_crc32", func(t *testing.T) {
-		if _, err := New([]File{{Name: "a.txt", Size: 10, CRC32: 0}}, nil); err == nil {
-			t.Error("expected error for zero CRC32 with non-zero size")
-		}
-	})
-
 	t.Run("zero_size_zero_crc_ok", func(t *testing.T) {
 		if _, err := New([]File{{Name: "a.txt", Size: 0, CRC32: 0}}, nil); err != nil {
 			t.Errorf("unexpected error for zero-size file with zero CRC32: %v", err)
