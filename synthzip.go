@@ -28,6 +28,10 @@ type File struct {
 	CRC32 uint32
 }
 
+func (f *File) lazyCRC32() bool {
+	return f.Size > 0 && f.CRC32 == 0
+}
+
 type file struct {
 	File
 
@@ -89,10 +93,10 @@ type Archive struct {
 // reads that start within a file's data region.
 func New(filesIn []File, open func(name string) (io.ReadCloser, error)) (*Archive, error) {
 	var (
-		off, dataDescriptorCount int64
-		regions                  []region
-		archiveFiles             = make([]file, len(filesIn))
-		localOffsets             = make([]int64, len(filesIn))
+		off          int64
+		regions      []region
+		archiveFiles = make([]file, len(filesIn))
+		localOffsets = make([]int64, len(filesIn))
 	)
 	for i, f := range filesIn {
 		if f.Name == "" {
@@ -103,12 +107,6 @@ func New(filesIn []File, open func(name string) (io.ReadCloser, error)) (*Archiv
 		}
 		if f.Size < 0 {
 			return nil, fmt.Errorf("synthzip: file %d (%q) has negative size", i, f.Name)
-		}
-		if f.Size > 0 && f.CRC32 == 0 {
-			// Each data descriptor adds 16 bytes after the file data, and
-			// requires bit 3 of the general purpose flag in the local header
-			// and central directory entry.
-			dataDescriptorCount++
 		}
 
 		archiveFiles[i] = file{File: f}
@@ -136,8 +134,14 @@ func New(filesIn []File, open func(name string) (io.ReadCloser, error)) (*Archiv
 		}
 
 		// Optional data descriptor.
-		if f.Size > 0 && f.CRC32 == 0 {
-
+		if f.lazyCRC32() {
+			regions = append(regions, region{
+				offset: off,
+				length: 16,
+				kind:   regionFileDataDescriptor,
+				index:  i,
+			})
+			off += 16
 		}
 	}
 
@@ -229,6 +233,16 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 			eocd := makeEOCD(len(a.files), a.cdOffset, a.cdSize)
 			copy(dst, eocd[intraOffset:intraOffset+int64(n)])
 
+		case regionFileDataDescriptor:
+			f := &a.files[r.index]
+			if f.lazyCRC32() {
+				if err := a.ensureFileFullyRead(f); err != nil {
+					return total, err
+				}
+			}
+			dd := makeDataDescriptor(f)
+			copy(dst, dd[intraOffset:intraOffset+int64(n)])
+
 		case regionFileData:
 			rc, err := a.open(a.files[r.index].Name)
 			if err != nil {
@@ -252,6 +266,8 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 				}
 			}
 			rc.Close()
+		default:
+			return 0, fmt.Errorf("synthzip: unknown region kind %d", r.kind)
 		}
 
 		total += n
@@ -262,6 +278,22 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 		return total, io.EOF
 	}
 	return total, nil
+}
+
+func (a *Archive) ensureFileFullyRead(f *file) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.bytesRead >= f.Size {
+		return nil
+	}
+
+	rc, err := a.open(f.Name)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	return nil
 }
 
 // Read implements io.Reader, reading sequentially from the current read offset.
@@ -294,57 +326,64 @@ func (a *Archive) Seek(offset int64, whence int) (int64, error) {
 }
 
 func makeLocalHeader(f *file) []byte {
-	var flags uint16
-	if f.Size > 0 && f.CRC32 == 0 {
-		// Spec section 4.4.4; bit 3 indicates CRC-32 and sizes are in a data
-		// descriptor after file data.
-		flags |= 0x08
-	}
 	nameBytes := []byte(f.Name)
 	buf := make([]byte, 30+len(nameBytes))
-	binary.LittleEndian.PutUint32(buf[0:], 0x04034b50)              // signature
-	binary.LittleEndian.PutUint16(buf[4:], 20)                      // version needed
-	binary.LittleEndian.PutUint16(buf[6:], flags)                   // flags
-	binary.LittleEndian.PutUint16(buf[8:], 0)                       // compression: store
-	binary.LittleEndian.PutUint16(buf[10:], 0)                      // mod time
-	binary.LittleEndian.PutUint16(buf[12:], 0x0021)                 // mod date: 1980-01-01
-	binary.LittleEndian.PutUint32(buf[14:], f.CRC32)                // crc32
-	binary.LittleEndian.PutUint32(buf[18:], uint32(f.Size))         // compressed size
-	binary.LittleEndian.PutUint32(buf[22:], uint32(f.Size))         // uncompressed size
-	binary.LittleEndian.PutUint16(buf[26:], uint16(len(nameBytes))) // name length
-	binary.LittleEndian.PutUint16(buf[28:], 0)                      // extra field length
+	binary.LittleEndian.PutUint32(buf[0:], 0x04034b50) // signature
+	binary.LittleEndian.PutUint16(buf[4:], 20)         // version needed
+	makeHeaderCommon(f, buf[6:])
 	copy(buf[30:], nameBytes)
 	return buf
 }
 
+func makeDataDescriptor(f *file) []byte {
+	buf := make([]byte, 16)
+	binary.LittleEndian.PutUint32(buf[0:], 0x08074b50)      // signature
+	binary.LittleEndian.PutUint32(buf[4:], f.h.Sum32())     // crc32
+	binary.LittleEndian.PutUint32(buf[8:], uint32(f.Size))  // compressed size
+	binary.LittleEndian.PutUint32(buf[12:], uint32(f.Size)) // uncompressed size
+	return buf
+}
+
 func makeCentralDirEntry(f *file, localOffset int64) []byte {
+	nameBytes := []byte(f.Name)
+	buf := make([]byte, 46+len(nameBytes))
+	binary.LittleEndian.PutUint32(buf[0:], 0x02014b50) // signature
+	binary.LittleEndian.PutUint16(buf[4:], 0x0314)     // version made by: Unix, 2.0
+	binary.LittleEndian.PutUint16(buf[6:], 20)         // version needed
+	makeHeaderCommon(f, buf[8:])
+	binary.LittleEndian.PutUint16(buf[32:], 0)                   // file comment length
+	binary.LittleEndian.PutUint16(buf[34:], 0)                   // disk number start
+	binary.LittleEndian.PutUint16(buf[36:], 0)                   // internal attrs
+	binary.LittleEndian.PutUint32(buf[38:], 0o644<<16)           // external attrs: Unix 0644
+	binary.LittleEndian.PutUint32(buf[42:], uint32(localOffset)) // local header offset
+	copy(buf[46:], nameBytes)
+	return buf
+}
+
+func makeHeaderCommon(f *file, buf []byte) {
 	var flags uint16
-	if f.Size > 0 && f.CRC32 == 0 {
+	// Does the file use a trailing data descriptor for checksum and size?
+	dd := f.lazyCRC32()
+	if dd {
 		// Spec section 4.4.4; bit 3 indicates CRC-32 and sizes are in a data
 		// descriptor after file data.
 		flags |= 0x08
 	}
-	nameBytes := []byte(f.Name)
-	buf := make([]byte, 46+len(nameBytes))
-	binary.LittleEndian.PutUint32(buf[0:], 0x02014b50)              // signature
-	binary.LittleEndian.PutUint16(buf[4:], 0x0314)                  // version made by: Unix, 2.0
-	binary.LittleEndian.PutUint16(buf[6:], 20)                      // version needed
-	binary.LittleEndian.PutUint16(buf[8:], flags)                   // flags
-	binary.LittleEndian.PutUint16(buf[10:], 0)                      // compression: store
-	binary.LittleEndian.PutUint16(buf[12:], 0)                      // mod time
-	binary.LittleEndian.PutUint16(buf[14:], 0x0021)                 // mod date: 1980-01-01
-	binary.LittleEndian.PutUint32(buf[16:], f.CRC32)                // crc32
-	binary.LittleEndian.PutUint32(buf[20:], uint32(f.Size))         // compressed size
-	binary.LittleEndian.PutUint32(buf[24:], uint32(f.Size))         // uncompressed size
-	binary.LittleEndian.PutUint16(buf[28:], uint16(len(nameBytes))) // name length
-	binary.LittleEndian.PutUint16(buf[30:], 0)                      // extra field length
-	binary.LittleEndian.PutUint16(buf[32:], 0)                      // file comment length
-	binary.LittleEndian.PutUint16(buf[34:], 0)                      // disk number start
-	binary.LittleEndian.PutUint16(buf[36:], 0)                      // internal attrs
-	binary.LittleEndian.PutUint32(buf[38:], 0o644<<16)              // external attrs: Unix 0644
-	binary.LittleEndian.PutUint32(buf[42:], uint32(localOffset))    // local header offset
-	copy(buf[46:], nameBytes)
-	return buf
+	binary.LittleEndian.PutUint16(buf[0:], flags)  // flags
+	binary.LittleEndian.PutUint16(buf[2:], 0)      // compression: store
+	binary.LittleEndian.PutUint16(buf[4:], 0)      // mod time
+	binary.LittleEndian.PutUint16(buf[6:], 0x0021) // mod date: 1980-01-01
+	if dd {
+		binary.LittleEndian.PutUint32(buf[8:], 0)  // crc32
+		binary.LittleEndian.PutUint32(buf[12:], 0) // compressed size
+		binary.LittleEndian.PutUint32(buf[16:], 0) // uncompressed size
+	} else {
+		binary.LittleEndian.PutUint32(buf[8:], f.CRC32)         // crc32
+		binary.LittleEndian.PutUint32(buf[12:], uint32(f.Size)) // compressed size
+		binary.LittleEndian.PutUint32(buf[16:], uint32(f.Size)) // uncompressed size
+	}
+	binary.LittleEndian.PutUint16(buf[20:], uint16(len(f.Name))) // name length
+	binary.LittleEndian.PutUint16(buf[22:], 0)                   // extra field length
 }
 
 func makeEOCD(numFiles int, cdOffset, cdSize int64) []byte {

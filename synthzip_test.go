@@ -76,7 +76,8 @@ func verifyWithStdlib(t *testing.T, a *Archive, contents map[string][]byte) {
 	// same order as the synthetic archive.
 	var ref bytes.Buffer
 	zw := zip.NewWriter(&ref)
-	for _, f := range a.files {
+	for i := range a.files {
+		f := &a.files[i]
 		hdr := &zip.FileHeader{
 			Name:               f.Name,
 			Method:             zip.Store,
