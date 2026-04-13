@@ -248,24 +248,22 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 			if err != nil {
 				return total, err
 			}
+			defer rc.Close()
+
 			if ra, ok := rc.(io.ReaderAt); ok && intraOffset > 0 {
 				if _, err := ra.ReadAt(dst, intraOffset); err != nil {
-					rc.Close()
 					return total, err
 				}
 			} else {
 				if intraOffset > 0 {
 					if _, err := io.CopyN(io.Discard, rc, intraOffset); err != nil {
-						rc.Close()
 						return total, err
 					}
 				}
 				if _, err := io.ReadFull(rc, dst); err != nil {
-					rc.Close()
 					return total, err
 				}
 			}
-			rc.Close()
 		default:
 			return 0, fmt.Errorf("synthzip: unknown region kind %d", r.kind)
 		}
@@ -293,6 +291,31 @@ func (a *Archive) ensureFileFullyRead(f *file) error {
 		return err
 	}
 	defer rc.Close()
+
+	// Skip over already-read bytes.
+	if f.bytesRead > 0 {
+		rs, ok := rc.(io.Seeker)
+		if ok {
+			if _, err := rs.Seek(f.bytesRead, io.SeekStart); err != nil {
+				return err
+			}
+		} else {
+			if _, err := io.CopyN(io.Discard, rc, f.bytesRead); err != nil {
+				return err
+			}
+		}
+	}
+
+	n, err := io.Copy(f.h, rc)
+	if err != nil {
+		return err
+	}
+	f.bytesRead += n
+
+	if f.bytesRead != f.Size {
+		return fmt.Errorf("synthzip: expected to read %d bytes for file %q, but got %d", f.Size, f.Name, f.bytesRead)
+	}
+
 	return nil
 }
 
