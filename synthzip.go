@@ -3,12 +3,9 @@ package synthzip
 import (
 	"encoding/binary"
 	"fmt"
-	"hash"
-	"hash/crc32"
 	"io"
 	"path/filepath"
 	"sort"
-	"sync"
 )
 
 // See zip spec at https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
@@ -25,16 +22,10 @@ type File struct {
 	Size int64
 
 	// CRC32 is the CRC-32 checksum of the file content using the IEEE polynomial.
-	// Required for files with Size > 0.
+	// It may be omitted, in which case the CRC-32 field in the zip headers will
+	// also be zero and some tools will warn or error for non-empty files.
+	// However, the go standard library accepts zeroed CRC-32s without complaint.
 	CRC32 uint32
-}
-
-type file struct {
-	File
-
-	mu        sync.Mutex  // Protects the remaining fields.
-	bytesRead int64       // The number of bytes read into h so far.
-	h         hash.Hash32 // Bytes are summed into h as they are read if CRC-32 is not provided.
 }
 
 type regionKind uint8
@@ -67,7 +58,7 @@ var (
 // a functional [Archive]. It implements [io.Reader], [io.Seeker], and
 // [io.ReaderAt] for reading the archive contents.
 type Archive struct {
-	files        []file
+	files        []File
 	regions      []region
 	localOffsets []int64 // local header offset per file, needed by central dir entries
 	cdOffset     int64
@@ -87,14 +78,13 @@ type Archive struct {
 // As an optimisation, the open function may return a type that implements
 // [io.ReaderAt], which will be used to skip any leading bytes not needed for
 // reads that start within a file's data region.
-func New(filesIn []File, open func(name string) (io.ReadCloser, error)) (*Archive, error) {
+func New(files []File, open func(name string) (io.ReadCloser, error)) (*Archive, error) {
 	var (
 		off          int64
 		regions      []region
-		archiveFiles = make([]file, len(filesIn))
-		localOffsets = make([]int64, len(filesIn))
+		localOffsets = make([]int64, len(files))
 	)
-	for i, f := range filesIn {
+	for i, f := range files {
 		if f.Name == "" {
 			return nil, fmt.Errorf("synthzip: file %d has empty name", i)
 		}
@@ -103,11 +93,6 @@ func New(filesIn []File, open func(name string) (io.ReadCloser, error)) (*Archiv
 		}
 		if f.Size < 0 {
 			return nil, fmt.Errorf("synthzip: file %d (%q) has negative size", i, f.Name)
-		}
-
-		archiveFiles[i] = file{
-			File: f,
-			h:    crc32.NewIEEE(),
 		}
 
 		// Local file header.
@@ -135,7 +120,7 @@ func New(filesIn []File, open func(name string) (io.ReadCloser, error)) (*Archiv
 
 	// Central directory.
 	cdOffset := off
-	for i, f := range filesIn {
+	for i, f := range files {
 		nameLen := int64(len(f.Name))
 		entryLen := 46 + nameLen
 		regions = append(regions, region{
@@ -156,16 +141,15 @@ func New(filesIn []File, open func(name string) (io.ReadCloser, error)) (*Archiv
 	})
 	off += 22
 
-	a := &Archive{
+	return &Archive{
 		regions:      regions,
-		files:        archiveFiles,
+		files:        files,
 		localOffsets: localOffsets,
 		open:         open,
 		size:         off,
 		cdOffset:     cdOffset,
 		cdSize:       cdSize,
-	}
-	return a, nil
+	}, nil
 }
 
 // Size returns the total size of the zip archive in bytes. This is available
@@ -210,11 +194,11 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 
 		switch r.kind {
 		case regionLocalHeader:
-			hdr := makeLocalHeader(&a.files[r.index])
+			hdr := makeLocalHeader(a.files[r.index])
 			copy(dst, hdr[intraOffset:intraOffset+int64(n)])
 
 		case regionCentralDir:
-			entry := makeCentralDirEntry(&a.files[r.index], a.localOffsets[r.index])
+			entry := makeCentralDirEntry(a.files[r.index], a.localOffsets[r.index])
 			copy(dst, entry[intraOffset:intraOffset+int64(n)])
 
 		case regionEOCD:
@@ -222,8 +206,7 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 			copy(dst, eocd[intraOffset:intraOffset+int64(n)])
 
 		case regionFileData:
-			f := &a.files[r.index]
-			rc, err := a.open(f.Name)
+			rc, err := a.open(a.files[r.index].Name)
 			if err != nil {
 				return total, err
 			}
@@ -286,7 +269,7 @@ func (a *Archive) Seek(offset int64, whence int) (int64, error) {
 	return a.readOffset, nil
 }
 
-func makeLocalHeader(f *file) []byte {
+func makeLocalHeader(f File) []byte {
 	nameBytes := []byte(f.Name)
 	buf := make([]byte, 30+len(nameBytes))
 	binary.LittleEndian.PutUint32(buf[0:], 0x04034b50) // signature
@@ -296,16 +279,7 @@ func makeLocalHeader(f *file) []byte {
 	return buf
 }
 
-func makeDataDescriptor(f *file) []byte {
-	buf := make([]byte, 16)
-	binary.LittleEndian.PutUint32(buf[0:], 0x08074b50)      // signature
-	binary.LittleEndian.PutUint32(buf[4:], f.h.Sum32())     // crc32
-	binary.LittleEndian.PutUint32(buf[8:], uint32(f.Size))  // compressed size
-	binary.LittleEndian.PutUint32(buf[12:], uint32(f.Size)) // uncompressed size
-	return buf
-}
-
-func makeCentralDirEntry(f *file, localOffset int64) []byte {
+func makeCentralDirEntry(f File, localOffset int64) []byte {
 	nameBytes := []byte(f.Name)
 	buf := make([]byte, 46+len(nameBytes))
 	binary.LittleEndian.PutUint32(buf[0:], 0x02014b50) // signature
@@ -321,7 +295,7 @@ func makeCentralDirEntry(f *file, localOffset int64) []byte {
 	return buf
 }
 
-func makeHeaderCommon(f *file, buf []byte) {
+func makeHeaderCommon(f File, buf []byte) {
 	binary.LittleEndian.PutUint16(buf[0:], 0)                    // flags
 	binary.LittleEndian.PutUint16(buf[2:], 0)                    // compression: store
 	binary.LittleEndian.PutUint16(buf[4:], 0)                    // mod time
