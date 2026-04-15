@@ -29,10 +29,6 @@ type File struct {
 	CRC32 uint32
 }
 
-func (f *File) lazyCRC32() bool {
-	return f.Size > 0 && f.CRC32 == 0
-}
-
 type file struct {
 	File
 
@@ -41,83 +37,11 @@ type file struct {
 	h         hash.Hash32 // Bytes are summed into h as they are read if CRC-32 is not provided.
 }
 
-func (f *file) ensureFullyRead(open func(string) (io.ReadCloser, error)) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.bytesRead >= f.Size {
-		return nil
-	}
-
-	rc, err := open(f.Name)
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-
-	// Skip over already-read bytes.
-	if f.bytesRead > 0 {
-		rs, ok := rc.(io.Seeker)
-		if ok {
-			if _, err := rs.Seek(f.bytesRead, io.SeekStart); err != nil {
-				return err
-			}
-		} else {
-			if _, err := io.CopyN(io.Discard, rc, f.bytesRead); err != nil {
-				return err
-			}
-		}
-	}
-
-	n, err := io.Copy(f.h, rc)
-	if err != nil {
-		return err
-	}
-	f.bytesRead += n
-
-	if f.bytesRead != f.Size {
-		return fmt.Errorf("synthzip: expected to read %d bytes for file %q, but got %d", f.Size, f.Name, f.bytesRead)
-	}
-
-	return nil
-}
-
-func (f *file) maybeSumBytes(offset int64, b []byte) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.bytesRead >= f.Size {
-		// Already fully summed.
-		return
-	}
-
-	if offset > f.bytesRead {
-		// We must read bytes in order, but the offset is already beyond what
-		// we've read up to.
-		return
-	}
-
-	start := f.bytesRead - offset
-	if start >= int64(len(b)) {
-		// All the bytes in b are before our current cursor into the underlying file.
-		return
-	}
-
-	n, err := f.h.Write(b[start:])
-	if err != nil {
-		f.h.Reset()
-		f.bytesRead = 0
-		return
-	}
-	f.bytesRead += int64(n)
-}
-
 type regionKind uint8
 
 const (
 	regionLocalHeader regionKind = iota
 	regionFileData
-	regionFileDataDescriptor
 	regionCentralDir
 	regionEOCD
 )
@@ -206,17 +130,6 @@ func New(filesIn []File, open func(name string) (io.ReadCloser, error)) (*Archiv
 				index:  i,
 			})
 			off += f.Size
-		}
-
-		// Optional data descriptor.
-		if f.lazyCRC32() {
-			regions = append(regions, region{
-				offset: off,
-				length: 16,
-				kind:   regionFileDataDescriptor,
-				index:  i,
-			})
-			off += 16
 		}
 	}
 
@@ -308,16 +221,6 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 			eocd := makeEOCD(len(a.files), a.cdOffset, a.cdSize)
 			copy(dst, eocd[intraOffset:intraOffset+int64(n)])
 
-		case regionFileDataDescriptor:
-			f := &a.files[r.index]
-			if f.lazyCRC32() {
-				if err := f.ensureFullyRead(a.open); err != nil {
-					return total, err
-				}
-			}
-			dd := makeDataDescriptor(f)
-			copy(dst, dd[intraOffset:intraOffset+int64(n)])
-
 		case regionFileData:
 			f := &a.files[r.index]
 			rc, err := a.open(f.Name)
@@ -339,11 +242,6 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 				if _, err := io.ReadFull(rc, dst); err != nil {
 					return total, err
 				}
-			}
-
-			// If dst has bytes we can use for a lazily calculated CRC32, sum them now.
-			if f.lazyCRC32() {
-				f.maybeSumBytes(intraOffset, dst)
 			}
 		default:
 			return 0, fmt.Errorf("synthzip: unknown region kind %d", r.kind)
@@ -424,27 +322,13 @@ func makeCentralDirEntry(f *file, localOffset int64) []byte {
 }
 
 func makeHeaderCommon(f *file, buf []byte) {
-	var flags uint16
-	// Does the file use a trailing data descriptor for checksum and size?
-	dd := f.lazyCRC32()
-	if dd {
-		// Spec section 4.4.4; bit 3 indicates CRC-32 and sizes are in a data
-		// descriptor after file data.
-		flags |= 0x08
-	}
-	binary.LittleEndian.PutUint16(buf[0:], flags)  // flags
-	binary.LittleEndian.PutUint16(buf[2:], 0)      // compression: store
-	binary.LittleEndian.PutUint16(buf[4:], 0)      // mod time
-	binary.LittleEndian.PutUint16(buf[6:], 0x0021) // mod date: 1980-01-01
-	if dd {
-		binary.LittleEndian.PutUint32(buf[8:], 0)               // crc32
-		binary.LittleEndian.PutUint32(buf[12:], uint32(f.Size)) // compressed size
-		binary.LittleEndian.PutUint32(buf[16:], uint32(f.Size)) // uncompressed size
-	} else {
-		binary.LittleEndian.PutUint32(buf[8:], f.CRC32)         // crc32
-		binary.LittleEndian.PutUint32(buf[12:], uint32(f.Size)) // compressed size
-		binary.LittleEndian.PutUint32(buf[16:], uint32(f.Size)) // uncompressed size
-	}
+	binary.LittleEndian.PutUint16(buf[0:], 0)                    // flags
+	binary.LittleEndian.PutUint16(buf[2:], 0)                    // compression: store
+	binary.LittleEndian.PutUint16(buf[4:], 0)                    // mod time
+	binary.LittleEndian.PutUint16(buf[6:], 0x0021)               // mod date: 1980-01-01
+	binary.LittleEndian.PutUint32(buf[8:], f.CRC32)              // crc32
+	binary.LittleEndian.PutUint32(buf[12:], uint32(f.Size))      // compressed size
+	binary.LittleEndian.PutUint32(buf[16:], uint32(f.Size))      // uncompressed size
 	binary.LittleEndian.PutUint16(buf[20:], uint16(len(f.Name))) // name length
 	binary.LittleEndian.PutUint16(buf[22:], 0)                   // extra field length
 }
