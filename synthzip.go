@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash"
+	"hash/crc32"
 	"io"
 	"path/filepath"
 	"sort"
@@ -38,6 +39,77 @@ type file struct {
 	mu        sync.Mutex  // Protects the remaining fields.
 	bytesRead int64       // The number of bytes read into h so far.
 	h         hash.Hash32 // Bytes are summed into h as they are read if CRC-32 is not provided.
+}
+
+func (f *file) ensureFullyRead(open func(string) (io.ReadCloser, error)) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.bytesRead >= f.Size {
+		return nil
+	}
+
+	rc, err := open(f.Name)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	// Skip over already-read bytes.
+	if f.bytesRead > 0 {
+		rs, ok := rc.(io.Seeker)
+		if ok {
+			if _, err := rs.Seek(f.bytesRead, io.SeekStart); err != nil {
+				return err
+			}
+		} else {
+			if _, err := io.CopyN(io.Discard, rc, f.bytesRead); err != nil {
+				return err
+			}
+		}
+	}
+
+	n, err := io.Copy(f.h, rc)
+	if err != nil {
+		return err
+	}
+	f.bytesRead += n
+
+	if f.bytesRead != f.Size {
+		return fmt.Errorf("synthzip: expected to read %d bytes for file %q, but got %d", f.Size, f.Name, f.bytesRead)
+	}
+
+	return nil
+}
+
+func (f *file) maybeSumBytes(offset int64, b []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.bytesRead >= f.Size {
+		// Already fully summed.
+		return
+	}
+
+	if offset > f.bytesRead {
+		// We must read bytes in order, but the offset is already beyond what
+		// we've read up to.
+		return
+	}
+
+	start := f.bytesRead - offset
+	if start >= int64(len(b)) {
+		// All the bytes in b are before our current cursor into the underlying file.
+		return
+	}
+
+	n, err := f.h.Write(b[start:])
+	if err != nil {
+		f.h.Reset()
+		f.bytesRead = 0
+		return
+	}
+	f.bytesRead += int64(n)
 }
 
 type regionKind uint8
@@ -109,7 +181,10 @@ func New(filesIn []File, open func(name string) (io.ReadCloser, error)) (*Archiv
 			return nil, fmt.Errorf("synthzip: file %d (%q) has negative size", i, f.Name)
 		}
 
-		archiveFiles[i] = file{File: f}
+		archiveFiles[i] = file{
+			File: f,
+			h:    crc32.NewIEEE(),
+		}
 
 		// Local file header.
 		localOffsets[i] = off
@@ -236,7 +311,7 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 		case regionFileDataDescriptor:
 			f := &a.files[r.index]
 			if f.lazyCRC32() {
-				if err := a.ensureFileFullyRead(f); err != nil {
+				if err := f.ensureFullyRead(a.open); err != nil {
 					return total, err
 				}
 			}
@@ -244,7 +319,8 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 			copy(dst, dd[intraOffset:intraOffset+int64(n)])
 
 		case regionFileData:
-			rc, err := a.open(a.files[r.index].Name)
+			f := &a.files[r.index]
+			rc, err := a.open(f.Name)
 			if err != nil {
 				return total, err
 			}
@@ -264,6 +340,11 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 					return total, err
 				}
 			}
+
+			// If dst has bytes we can use for a lazily calculated CRC32, sum them now.
+			if f.lazyCRC32() {
+				f.maybeSumBytes(intraOffset, dst)
+			}
 		default:
 			return 0, fmt.Errorf("synthzip: unknown region kind %d", r.kind)
 		}
@@ -276,47 +357,6 @@ func (a *Archive) ReadAt(p []byte, off int64) (int, error) {
 		return total, io.EOF
 	}
 	return total, nil
-}
-
-func (a *Archive) ensureFileFullyRead(f *file) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.bytesRead >= f.Size {
-		return nil
-	}
-
-	rc, err := a.open(f.Name)
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-
-	// Skip over already-read bytes.
-	if f.bytesRead > 0 {
-		rs, ok := rc.(io.Seeker)
-		if ok {
-			if _, err := rs.Seek(f.bytesRead, io.SeekStart); err != nil {
-				return err
-			}
-		} else {
-			if _, err := io.CopyN(io.Discard, rc, f.bytesRead); err != nil {
-				return err
-			}
-		}
-	}
-
-	n, err := io.Copy(f.h, rc)
-	if err != nil {
-		return err
-	}
-	f.bytesRead += n
-
-	if f.bytesRead != f.Size {
-		return fmt.Errorf("synthzip: expected to read %d bytes for file %q, but got %d", f.Size, f.Name, f.bytesRead)
-	}
-
-	return nil
 }
 
 // Read implements io.Reader, reading sequentially from the current read offset.
@@ -397,9 +437,9 @@ func makeHeaderCommon(f *file, buf []byte) {
 	binary.LittleEndian.PutUint16(buf[4:], 0)      // mod time
 	binary.LittleEndian.PutUint16(buf[6:], 0x0021) // mod date: 1980-01-01
 	if dd {
-		binary.LittleEndian.PutUint32(buf[8:], 0)  // crc32
-		binary.LittleEndian.PutUint32(buf[12:], 0) // compressed size
-		binary.LittleEndian.PutUint32(buf[16:], 0) // uncompressed size
+		binary.LittleEndian.PutUint32(buf[8:], 0)               // crc32
+		binary.LittleEndian.PutUint32(buf[12:], uint32(f.Size)) // compressed size
+		binary.LittleEndian.PutUint32(buf[16:], uint32(f.Size)) // uncompressed size
 	} else {
 		binary.LittleEndian.PutUint32(buf[8:], f.CRC32)         // crc32
 		binary.LittleEndian.PutUint32(buf[12:], uint32(f.Size)) // compressed size
