@@ -71,9 +71,9 @@ type Archive struct {
 
 // New creates a new [Archive] from the given file list. Files appear in the zip
 // in the order provided. Returns an error if any file has an empty name,
-// negative size, or zero CRC32 with non-zero size. The open function will not
-// be called during construction. It will be passed the provided file name from
-// files when a read on the returned [Archive] requires its contents.
+// or negative size. The open function will not be called during construction.
+// It will be passed the provided file name from files when a read on the
+// returned [Archive] requires its contents.
 //
 // As an optimisation, the open function may return a type that implements
 // [io.ReaderAt], which will be used to skip any leading bytes not needed for
